@@ -143,17 +143,36 @@ def least_squares(xs, ys):
     return a, b, resid
 
 
+def rate_at(read, i):
+    """Rate for trophy i in one read, or None when unusable.
+
+    Tolerates a read whose rates list is missing or shorter than the trophy
+    list (trophy absent from that read), a null rate, and a rate that is not
+    a finite number (bool, string, NaN, inf) -- all read as "not observed"
+    instead of crashing the run or poisoning the fit.
+    """
+    rates = read.get("rates") or []
+    if i >= len(rates):
+        return None
+    rate = rates[i]
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        return None
+    if not math.isfinite(rate):
+        return None
+    return rate
+
+
 def last_non_null(reads, i):
-    """Most recent non-null rate for trophy i, else 0.5 as a neutral fallback."""
+    """Most recent usable rate for trophy i, else 0.5 as a neutral fallback."""
     for read in reversed(reads):
-        rate = read["rates"][i]
+        rate = rate_at(read, i)
         if rate is not None:
             return rate
     return 0.5
 
 
 def forecast_case(case: dict, name: str) -> dict:
-    history = case["history"]
+    history = case.get("history") or []
     if not history:
         raise ValueError(f"{name} has no history")
     trophies = case["trophies"]
@@ -161,7 +180,22 @@ def forecast_case(case: dict, name: str) -> dict:
     z_scores = [norm_ppf(level) for level in levels]
     checkpoint = parse_time(case["at"])
     target = parse_time(case["target"])
-    horizon_days = case["horizon_minutes"] / 1440.0
+    # Robustness: a missing, null or negative horizon reads as "no time
+    # passes" (the spread keeps only its base terms) instead of crashing.
+    horizon_raw = case.get("horizon_minutes")
+    if isinstance(horizon_raw, bool) or not isinstance(horizon_raw, (int, float)) \
+            or not math.isfinite(horizon_raw) or horizon_raw < 0:
+        horizon_raw = 0
+    horizon_days = horizon_raw / 1440.0
+    # Robustness: normalise each read's tracked-player count in place -- a
+    # missing, null, non-numeric or negative count becomes 0 ("base
+    # unknown"). The model keys off rates only, so this never changes a
+    # forecast; it keeps a damaged read from breaking any count consumer.
+    for read in history:
+        tracked = read.get("players_tracked")
+        if isinstance(tracked, bool) or not isinstance(tracked, (int, float)) \
+                or not math.isfinite(tracked) or tracked < 0:
+            read["players_tracked"] = 0
 
     # Fit window: the last 24 hours of reads (all of them on the practice).
     window_start = checkpoint - FIT_WINDOW
@@ -172,7 +206,7 @@ def forecast_case(case: dict, name: str) -> dict:
     # Flat history? Every trophy's rate unchanged across the whole window.
     flat = True
     for i in range(len(trophies)):
-        seen = {r["rates"][i] for r in window if r["rates"][i] is not None}
+        seen = {rate_at(r, i) for r in window if rate_at(r, i) is not None}
         if len(seen) > 1:
             flat = False
             break
@@ -184,7 +218,7 @@ def forecast_case(case: dict, name: str) -> dict:
     for i in range(len(trophies)):
         xs, ys = [], []
         for read in window:
-            rate = read["rates"][i]
+            rate = rate_at(read, i)
             if rate is not None:
                 xs.append(log_hours(parse_time(read["at"])))
                 ys.append(logit(rate))
@@ -192,8 +226,8 @@ def forecast_case(case: dict, name: str) -> dict:
 
     # Pool each tier's slopes (median), then shrink every slope toward it.
     pooled = {}
-    for tier in {t["tier"] for t in trophies}:
-        slopes = [fits[i][1] for i, t in enumerate(trophies) if t["tier"] == tier]
+    for tier in {t.get("tier") for t in trophies}:
+        slopes = [fits[i][1] for i, t in enumerate(trophies) if t.get("tier") == tier]
         pooled[tier] = statistics.median(slopes) if slopes else 0.0
 
     rows = []
@@ -207,7 +241,7 @@ def forecast_case(case: dict, name: str) -> dict:
                 median = last * FLAT_MEDIAN_FACTOR
             spread = FLAT_SPREAD
         else:
-            b_shrunk = b + SHRINK * (pooled[trophy["tier"]] - b)
+            b_shrunk = b + SHRINK * (pooled[trophy.get("tier")] - b)
             median = sigmoid(a + b_shrunk * x_target)
             spread = TREND_SIGMA * math.sqrt(horizon_days) + TREND_BASE_SPREAD \
                 + max(resid, RESIDUAL_FLOOR)
